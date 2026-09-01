@@ -18,7 +18,7 @@ REC_MODEL_DIR = MODEL_ROOT / "PP-OCRv6_small_rec"
 INTER_DIR = PROJECT_ROOT / "inter"
 TEXT_CROP_DIR = INTER_DIR / "text_crops"
 COMMAND_DIR = Path("./command")
-INPUT_IMAGE = Path("./assets/pdfs/110kV夺锦变电站.pdf")
+INPUT_IMAGE = Path("./assets/pdfs/220kV仿山变电站.pdf")
 PENDING_IMAGES = []
 
 # The sequence numbers are in the same narrow column as the "顺序" header.
@@ -28,8 +28,10 @@ COMMAND_RIGHT_BOUNDARY_RATIO = 0.89
 REC_BATCH_SIZE = 4
 OPERATION_TASK_MIN_SIMILARITY = 0.8
 OPERATION_TASK_MIN_CONFIDENCE = 0.75
+LOCAL_SEQUENCE_MIN_CONFIDENCE = 0.5
 UPLOAD_ORDER_ERROR = "请按照正确顺序上传操作票或拍摄更清晰的操作票"
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+NON_ENTRY_STATUS_TEXTS = {"已执行", "未执行", "作废"}
 
 
 def crop_text_region(image, points):
@@ -460,11 +462,25 @@ def extract_field_value(
     return value
 
 
-def _sequence_value(text):
+def _sequence_value(text, *, allow_wrappers=False):
     normalized = _normalized_text(text)
     if re.fullmatch(r"\d{1,3}", normalized):
         return int(normalized)
+    if allow_wrappers:
+        match = re.fullmatch(
+            r"[.:：。·,，;；|丨!！]*([0-9]{1,3})[.:：。·,，;；|丨!！]*",
+            normalized,
+        )
+        if match is not None:
+            return int(match.group(1))
     return None
+
+
+def _is_non_entry_status_text(text):
+    normalized = _normalized_text(text).strip(
+        "()（）[]【】.:：。·,，;；|丨!！√✓✔∨V"
+    )
+    return normalized in NON_ENTRY_STATUS_TEXTS
 
 
 def _split_merged_sequence_entry(record, sequence_anchor):
@@ -486,7 +502,255 @@ def _split_merged_sequence_entry(record, sequence_anchor):
     return int(match.group(1)), match.group(2)
 
 
-def extract_entries(records, image_shape):
+def _group_operation_content_rows(records, sequence_anchor, image_shape, sequence_records):
+    """Group operation-text boxes into rows without relying on sequence boxes."""
+    image_height, image_width = image_shape[:2]
+    command_right = image_width * COMMAND_RIGHT_BOUNDARY_RATIO
+    sequence_record_ids = {
+        record["index"] for _, record, _ in sequence_records
+    }
+    sequence_centers = sorted(
+        record["center_y"] for _, record, _ in sequence_records
+    )
+    if sequence_centers:
+        max_center_y = sequence_centers[-1] + image_height * 0.08
+    else:
+        max_center_y = image_height
+
+    check_texts = {"V", "√", "✓", "✔", "∨"}
+    content_records = [
+        record
+        for record in records
+        if record["index"] not in sequence_record_ids
+        and sequence_anchor["bottom"] < record["center_y"] <= max_center_y
+        and record["center_x"] > sequence_anchor["right"]
+        and record["center_x"] < command_right
+        and _normalized_text(record["text"])
+        and _normalized_text(record["text"]) not in check_texts
+        and not _is_non_entry_status_text(record["text"])
+        and _sequence_value(record["text"], allow_wrappers=True) is None
+    ]
+    content_records.sort(key=lambda record: (record["center_y"], record["left"]))
+    if not content_records:
+        return []
+
+    heights = [
+        max(record["bottom"] - record["top"], 1.0)
+        for record in content_records
+    ]
+    cluster_tolerance = max(float(np.median(heights)) * 0.5, image_height * 0.003)
+    rows = []
+    for record in content_records:
+        if (
+            not rows
+            or record["center_y"] - rows[-1]["center_y"] > cluster_tolerance
+        ):
+            rows.append(
+                {
+                    "records": [record],
+                    "top": record["top"],
+                    "bottom": record["bottom"],
+                    "center_y": record["center_y"],
+                }
+            )
+            continue
+
+        row = rows[-1]
+        row["records"].append(record)
+        row["top"] = min(row["top"], record["top"])
+        row["bottom"] = max(row["bottom"], record["bottom"])
+        row["center_y"] = float(
+            np.median([item["center_y"] for item in row["records"]])
+        )
+    return rows
+
+
+def _crop_overlaps_sequence_record(x1, y1, x2, y2, sequence_record):
+    return (
+        x1 < sequence_record["right"]
+        and x2 > sequence_record["left"]
+        and y1 < sequence_record["bottom"]
+        and y2 > sequence_record["top"]
+    )
+
+
+def _filter_continuous_recoveries(sequence_records, recovered):
+    """Keep recovered values only when each primary-sequence gap is complete."""
+    recovered = sorted(recovered, key=lambda item: item[1]["center_y"])
+    if not recovered:
+        return []
+
+    existing = sorted(sequence_records, key=lambda item: item[1]["center_y"])
+    if not existing:
+        values = [sequence for sequence, _, _ in recovered]
+        if values[0] < 1 or any(
+            current != previous + 1
+            for previous, current in zip(values, values[1:])
+        ):
+            return []
+        return recovered
+
+    accepted = []
+
+    first_sequence, first_record, _ = existing[0]
+    before = [
+        item
+        for item in recovered
+        if item[1]["center_y"] < first_record["center_y"]
+    ]
+    before_values = [sequence for sequence, _, _ in before]
+    expected_before = list(
+        range(first_sequence - len(before_values), first_sequence)
+    )
+    if expected_before and expected_before[0] >= 1 and before_values == expected_before:
+        accepted.extend(before)
+
+    for previous, current in zip(existing, existing[1:]):
+        previous_sequence, previous_record, _ = previous
+        current_sequence, current_record, _ = current
+        between = [
+            item
+            for item in recovered
+            if previous_record["center_y"]
+            < item[1]["center_y"]
+            < current_record["center_y"]
+        ]
+        between_values = [sequence for sequence, _, _ in between]
+        expected_between = list(
+            range(previous_sequence + 1, current_sequence)
+        )
+        if between_values == expected_between:
+            accepted.extend(between)
+
+    last_sequence, last_record, _ = existing[-1]
+    after = [
+        item
+        for item in recovered
+        if item[1]["center_y"] > last_record["center_y"]
+    ]
+    after_values = [sequence for sequence, _, _ in after]
+    expected_after = list(
+        range(last_sequence + 1, last_sequence + 1 + len(after_values))
+    )
+    if after_values == expected_after:
+        accepted.extend(after)
+
+    return accepted
+
+
+def _recover_missing_sequence_records(
+    records,
+    sequence_anchor,
+    sequence_records,
+    image_shape,
+    source_image,
+    rec_model,
+):
+    """Recognize sequence cells for content rows whose number box was missed."""
+    content_rows = _group_operation_content_rows(
+        records,
+        sequence_anchor,
+        image_shape,
+        sequence_records,
+    )
+    if not content_rows:
+        return []
+
+    row_centers = [row["center_y"] for row in content_rows]
+    row_differences = [
+        row_centers[index] - row_centers[index - 1]
+        for index in range(1, len(row_centers))
+        if row_centers[index] > row_centers[index - 1]
+    ]
+    typical_spacing = (
+        float(np.median(row_differences))
+        if row_differences
+        else image_shape[0] * 0.03
+    )
+    row_heights = [max(row["bottom"] - row["top"], 1.0) for row in content_rows]
+    alignment_tolerance = max(
+        typical_spacing * 0.35,
+        float(np.median(row_heights)) * 0.75,
+        image_shape[0] * 0.006,
+    )
+    existing_centers = [
+        record["center_y"] for _, record, _ in sequence_records
+    ]
+    missing_rows = [
+        row
+        for row in content_rows
+        if not any(
+            abs(row["center_y"] - center_y) <= alignment_tolerance
+            for center_y in existing_centers
+        )
+    ]
+    if not missing_rows:
+        return []
+
+    image_height, image_width = image_shape[:2]
+    sequence_width = max(sequence_anchor["right"] - sequence_anchor["left"], 1.0)
+    x1 = max(int(sequence_anchor["left"] - sequence_width * 0.1), 0)
+    x2 = min(int(sequence_anchor["right"] + sequence_width * 0.1), image_width)
+    cell_crops = []
+    crop_rows = []
+    crop_geometries = []
+    for row in missing_rows:
+        row_height = max(row["bottom"] - row["top"], 1.0)
+        y1 = max(int(row["top"] - row_height * 0.25), 0)
+        y2 = min(int(row["bottom"] + row_height * 0.25), image_height)
+        if any(
+            _crop_overlaps_sequence_record(x1, y1, x2, y2, record)
+            for _, record, _ in sequence_records
+        ):
+            continue
+        cell_crops.append(source_image[y1:y2, x1:x2])
+        crop_rows.append(row)
+        crop_geometries.append((y1, y2, row["center_y"]))
+
+    if not cell_crops:
+        return []
+
+    predictions = rec_model.predict(cell_crops, batch_size=REC_BATCH_SIZE)
+    if len(predictions) != len(crop_rows):
+        raise ValueError(
+            "Local sequence recognition result and row counts differ: "
+            f"{len(predictions)} != {len(crop_rows)}"
+        )
+
+    recovered = []
+    for recovery_index, (prediction, geometry) in enumerate(
+        zip(predictions, crop_geometries)
+    ):
+        try:
+            score = float(prediction["rec_score"])
+        except (KeyError, TypeError):
+            score = 0.0
+        sequence = _sequence_value(
+            prediction["rec_text"],
+            allow_wrappers=True,
+        )
+        if sequence is None or score < LOCAL_SEQUENCE_MIN_CONFIDENCE:
+            continue
+
+        y1, y2, center_y = geometry
+        synthetic_record = {
+            "index": -(recovery_index + 1),
+            "text": str(sequence),
+            "score": score,
+            "det_score": 0.0,
+            "box": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            "left": float(x1),
+            "right": float(x2),
+            "top": float(y1),
+            "bottom": float(y2),
+            "center_x": (x1 + x2) / 2,
+            "center_y": center_y,
+        }
+        recovered.append((sequence, synthetic_record, ""))
+    return _filter_continuous_recoveries(sequence_records, recovered)
+
+
+def extract_entries(records, image_shape, source_image=None, rec_model=None):
     """Extract operation item text by anchoring rows on their sequence numbers."""
     image_height, image_width = image_shape[:2]
     sequence_anchor = find_text_anchor(records, "顺序")
@@ -494,10 +758,13 @@ def extract_entries(records, image_shape):
 
     sequence_records = []
     for record in records:
-        sequence = _sequence_value(record["text"])
         is_below_anchor = record["center_y"] > sequence_anchor["bottom"]
         is_in_sequence_column = (
             abs(record["center_x"] - sequence_anchor["center_x"]) <= x_tolerance
+        )
+        sequence = _sequence_value(
+            record["text"],
+            allow_wrappers=is_in_sequence_column,
         )
         if sequence is not None and is_below_anchor and is_in_sequence_column:
             sequence_records.append((sequence, record, ""))
@@ -520,6 +787,18 @@ def extract_entries(records, image_shape):
         )
         sequence_records.append(
             (sequence, synthetic_sequence_record, inline_text)
+        )
+
+    if source_image is not None and rec_model is not None:
+        sequence_records.extend(
+            _recover_missing_sequence_records(
+                records,
+                sequence_anchor,
+                sequence_records,
+                image_shape,
+                source_image,
+                rec_model,
+            )
         )
 
     sequence_records.sort(key=lambda item: item[1]["center_y"])
@@ -560,6 +839,7 @@ def extract_entries(records, image_shape):
             and record["center_x"] > sequence_record["right"]
             and record["center_x"] < command_right
             and _normalized_text(record["text"])
+            and not _is_non_entry_status_text(record["text"])
         ]
         text_records.sort(key=lambda item: (item["center_y"], item["left"]))
         entry_text = inline_text + "".join(
@@ -576,7 +856,7 @@ def extract_entries(records, image_shape):
     return entries
 
 
-def extract_ticket_data(records, image_shape):
+def extract_ticket_data(records, image_shape, source_image=None, rec_model=None):
     """Extract the requested fields from one operation ticket."""
     return {
         "substation": extract_field_value(
@@ -586,7 +866,12 @@ def extract_ticket_data(records, image_shape):
         ),
         "mission": extract_mission(records),
         "id": extract_field_value(records, "编号"),
-        "entries": extract_entries(records, image_shape),
+        "entries": extract_entries(
+            records,
+            image_shape,
+            source_image=source_image,
+            rec_model=rec_model,
+        ),
     }
 
 
@@ -635,9 +920,21 @@ def merge_ticket_data_page(ticket_data_list, page_data, page_path):
     )
 
 
-def merge_ticket_page(ticket_data_list, records, image_shape, page_path):
+def merge_ticket_page(
+    ticket_data_list,
+    records,
+    image_shape,
+    page_path,
+    source_image=None,
+    rec_model=None,
+):
     """Parse and merge one page into the ordered operation-ticket list."""
-    page_data = extract_ticket_data(records, image_shape)
+    page_data = extract_ticket_data(
+        records,
+        image_shape,
+        source_image=source_image,
+        rec_model=rec_model,
+    )
     merge_ticket_data_page(ticket_data_list, page_data, page_path)
 
     return ticket_data_list
@@ -727,6 +1024,8 @@ def main():
                     records,
                     detection_result["input_img"].shape,
                     page_path,
+                    source_image=detection_result["input_img"],
+                    rec_model=rec_model,
                 )
     except ValueError as error:
         if str(error) == UPLOAD_ORDER_ERROR:
