@@ -9,7 +9,7 @@ PDF_PAGE_ROOT = PROJECT_ROOT / "inter" / "preprocessed"
 PDF_DPI = 260
 HEADER_HEIGHT_RATIO = 0.12
 TICKET_TITLE = "变电站倒闸操作票"
-TITLE_MIN_SIMILARITY = 0.8
+TITLE_MIN_SIMILARITY = 0.6
 
 
 def _normalized_text(text):

@@ -18,7 +18,7 @@ REC_MODEL_DIR = MODEL_ROOT / "PP-OCRv6_small_rec"
 INTER_DIR = PROJECT_ROOT / "inter"
 TEXT_CROP_DIR = INTER_DIR / "text_crops"
 COMMAND_DIR = Path("./command")
-INPUT_IMAGE = Path("./assets/pdfs/220kV仿山变电站.pdf")
+INPUT_IMAGE = Path("./assets/pdfs/110kV夺锦变电站.pdf")
 PENDING_IMAGES = []
 
 # The sequence numbers are in the same narrow column as the "顺序" header.
@@ -239,6 +239,188 @@ def find_operation_task_anchor(records):
         )
 
 
+def _mission_label_prefix(text):
+    """Return a mission-label prefix only when it starts the OCR text."""
+    normalized = _normalized_text(text)
+    for prefix in ("操作任务", "操作务", "操作", "任务"):
+        if normalized.startswith(prefix):
+            return prefix
+    return None
+
+
+def _vertical_gap(record, band_top, band_bottom):
+    if record["bottom"] < band_top:
+        return band_top - record["bottom"]
+    if record["top"] > band_bottom:
+        return record["top"] - band_bottom
+    return 0.0
+
+
+def _find_mission_label_records(records, sequence_anchor):
+    """Find the label boxes immediately above the operation table header."""
+    sequence_width = sequence_anchor["right"] - sequence_anchor["left"]
+    label_left_limit = sequence_anchor["right"] + max(sequence_width * 0.25, 5.0)
+    candidates = [
+        record
+        for record in records
+        if record["center_y"] < sequence_anchor["top"]
+        and record["left"] <= label_left_limit
+        and _mission_label_prefix(record["text"]) is not None
+    ]
+    if not candidates:
+        return []
+
+    # "操作开始时间" is also in the left column. Start with the closest
+    # label-like box above "顺序", then only join vertically adjacent parts.
+    seed = max(candidates, key=lambda record: record["bottom"])
+    selected = [seed]
+    selected_ids = {seed["index"]}
+    band_top = seed["top"]
+    band_bottom = seed["bottom"]
+
+    changed = True
+    while changed:
+        changed = False
+        band_height = max(band_bottom - band_top, 1.0)
+        for record in candidates:
+            if record["index"] in selected_ids:
+                continue
+            record_height = max(record["bottom"] - record["top"], 1.0)
+            allowed_gap = max(min(band_height, record_height) * 0.3, 3.0)
+            if _vertical_gap(record, band_top, band_bottom) > allowed_gap:
+                continue
+            selected.append(record)
+            selected_ids.add(record["index"])
+            band_top = min(band_top, record["top"])
+            band_bottom = max(band_bottom, record["bottom"])
+            changed = True
+
+    return selected
+
+
+def _find_check_column_left(records, sequence_anchor):
+    """Locate the check column from the operation-table header row."""
+    sequence_width = max(sequence_anchor["right"] - sequence_anchor["left"], 1.0)
+    row_records = [
+        record
+        for record in records
+        if record["top"] <= sequence_anchor["bottom"]
+        and record["bottom"] >= sequence_anchor["top"]
+        and record["center_x"] > sequence_anchor["right"]
+    ]
+    check_texts = {"√", "✓", "✔", "∨"}
+    recognized_checks = [
+        record
+        for record in row_records
+        if _normalized_text(record["text"]) in check_texts
+    ]
+    if recognized_checks:
+        return min(record["left"] for record in recognized_checks)
+
+    narrow_records = [
+        record
+        for record in row_records
+        if record["right"] - record["left"] <= sequence_width * 1.5
+    ]
+    if narrow_records:
+        return max(narrow_records, key=lambda record: record["center_x"])["left"]
+    return float("inf")
+
+
+def _is_operation_mode_text(text):
+    normalized = _normalized_text(text)
+    return re.fullmatch(
+        r"[()（）√✓✔∨]*(?:监护下操作|单人操作|检修人员操作)",
+        normalized,
+    ) is not None
+
+
+def extract_mission(records):
+    """Extract a one- or multi-line mission without a fixed right boundary."""
+    sequence_anchor = find_text_anchor(records, "顺序")
+    header_records = [
+        record
+        for record in records
+        if record["center_y"] < sequence_anchor["top"]
+    ]
+    check_column_left = _find_check_column_left(records, sequence_anchor)
+    mission_header_records = [
+        record
+        for record in header_records
+        if record["left"] < check_column_left
+        and not _is_operation_mode_text(record["text"])
+    ]
+    label_records = _find_mission_label_records(header_records, sequence_anchor)
+
+    # Keep the established layout fallback for labels whose OCR text is too
+    # damaged to expose either "操作" or "任务".
+    if not label_records:
+        label_anchor = find_operation_task_anchor(records)
+        return extract_field_value(
+            mission_header_records,
+            "操作任务",
+            label_anchor=label_anchor,
+        )
+
+    prefixes = {
+        _mission_label_prefix(record["text"])
+        for record in label_records
+    }
+    has_complete_label = (
+        "操作任务" in prefixes
+        or "操作务" in prefixes
+        or ("操作" in prefixes and "任务" in prefixes)
+    )
+    if not has_complete_label:
+        label_anchor = find_operation_task_anchor(records)
+        return extract_field_value(
+            mission_header_records,
+            "操作任务",
+            label_anchor=label_anchor,
+        )
+
+    band_top = min(record["top"] for record in label_records)
+    band_bottom = max(record["bottom"] for record in label_records)
+    label_heights = [
+        max(record["bottom"] - record["top"], 1.0)
+        for record in label_records
+    ]
+    band_padding = max(float(np.median(label_heights)) * 0.25, 3.0)
+    label_column_right = sequence_anchor["right"]
+
+    mission_records = [
+        record
+        for record in mission_header_records
+        if record["top"] <= band_bottom + band_padding
+        and record["bottom"] >= band_top - band_padding
+        and _normalized_text(record["text"])
+    ]
+    mission_records.sort(key=lambda item: (item["center_y"], item["left"]))
+
+    parts = []
+    for record in mission_records:
+        text = _normalized_text(record["text"])
+        prefix = None
+        if record["left"] <= label_column_right:
+            prefix = _mission_label_prefix(text)
+        if prefix is not None:
+            text = text[len(prefix) :]
+        elif record["center_x"] <= label_column_right:
+            continue
+
+        # A detector box may extend into the dynamically located check column.
+        # Only remove a recognized check suffix; never reject the long text box.
+        if record["right"] >= check_column_left:
+            text = re.sub(r"[√✓✔∨]+$", "", text)
+        if text:
+            parts.append(text)
+
+    mission = "".join(parts)
+    if not mission:
+        raise ValueError("Cannot find a value to the right of '操作任务'")
+    return mission
+
+
 def extract_field_value(
     records,
     label_text,
@@ -396,20 +578,13 @@ def extract_entries(records, image_shape):
 
 def extract_ticket_data(records, image_shape):
     """Extract the requested fields from one operation ticket."""
-    mission_anchor = find_operation_task_anchor(records)
     return {
         "substation": extract_field_value(
             records,
             "单位",
             right_label_text="编号",
         ),
-        # The sample OCR drops "任" and reads this label as "操作务".
-        "mission": extract_field_value(
-            records,
-            "操作任务",
-            label_anchor=mission_anchor,
-            right_boundary=image_shape[1] * COMMAND_RIGHT_BOUNDARY_RATIO,
-        ),
+        "mission": extract_mission(records),
         "id": extract_field_value(records, "编号"),
         "entries": extract_entries(records, image_shape),
     }

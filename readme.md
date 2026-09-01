@@ -1,0 +1,10 @@
+变电站操作票识别与五防逻辑框架
+
+本机基于5070Ti做测试，环境Freeze为requiements.txt，如果为非50系列显卡请参照PPOCR官方配置进行环境配置操作
+https://www.paddleocr.ai/latest/index.html
+
+assets为数据文件夹，如果待识别内容为PDF则存至pdfs，为图片请存至png文件夹下的自定义文件夹  
+程序入口在det_rec中，目前仅支持修改21行的INPUT_IMAGE变量开始试验，支持单一PDF文件和存有图片的文件夹两种输入  
+中间处理结果保存在inter文件夹下，preprocessed文件夹为识别到当前输入中所有的操作票页，dec模型检测结果存储为inter文件夹下的图片，具体区域存储至text_crops文件夹
+
+最终识别结果存储至command文件夹
