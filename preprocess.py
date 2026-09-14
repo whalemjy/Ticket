@@ -10,6 +10,7 @@ PDF_DPI = 260
 HEADER_HEIGHT_RATIO = 0.12
 TICKET_TITLE = "变电站倒闸操作票"
 TITLE_MIN_SIMILARITY = 0.6
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 
 
 def _normalized_text(text):
@@ -139,7 +140,7 @@ def is_operation_ticket_page(image_path, det_model, rec_model, rec_batch_size=4)
 
 
 def preprocess_input(input_path, det_model, rec_model, rec_batch_size=4):
-    """Render/filter one PDF or PNG and return operation-ticket page paths."""
+    """Render/filter one PDF or supported image and return ticket page paths."""
     input_path = Path(input_path)
     if not input_path.is_file():
         raise FileNotFoundError(f"Input file does not exist: {input_path}")
@@ -147,11 +148,12 @@ def preprocess_input(input_path, det_model, rec_model, rec_batch_size=4):
     suffix = input_path.suffix.lower()
     if suffix == ".pdf":
         candidate_pages = _render_pdf_pages(input_path)
-    elif suffix == ".png":
+    elif suffix in IMAGE_SUFFIXES:
         candidate_pages = [input_path]
     else:
         raise ValueError(
-            f"Unsupported input type {input_path.suffix!r}; expected .pdf or .png"
+            f"Unsupported input type {input_path.suffix!r}; "
+            "expected .pdf, .png, .jpg, or .jpeg"
         )
 
     pending_images = [
