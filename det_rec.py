@@ -27,7 +27,7 @@ INTER_DIR = PROJECT_ROOT / "inter"
 TEXT_CROP_DIR = INTER_DIR / "text_crops"
 OCR_RESULT_DIR = INTER_DIR / "ocr_results"
 COMMAND_DIR = Path("./command")
-INPUT_IMAGE = Path("./assets/pdfs/110kV天香变电站.pdf")
+INPUT_IMAGE = Path("./assets/pdfs/110kV马岭岗变电站.pdf")
 PENDING_IMAGES = []
 
 # The sequence numbers are in the same narrow column as the "顺序" header.
@@ -874,6 +874,29 @@ def _filter_continuous_recoveries(sequence_records, recovered):
     return accepted
 
 
+def _repair_sandwiched_sequence_values(sequence_records):
+    """Repair one OCR value only when its two neighboring rows prove the value."""
+    ordered = sorted(sequence_records, key=lambda item: item[1]["center_y"])
+    repaired = list(ordered)
+    for index in range(1, len(ordered) - 1):
+        previous_sequence = repaired[index - 1][0]
+        sequence, record, inline_text = ordered[index]
+        next_sequence = ordered[index + 1][0]
+        expected = previous_sequence + 1
+
+        # Both neighbors must establish exactly one possible value. This handles
+        # repeated-character OCR collapses such as 10, 1, 12 -> 10, 11, 12.
+        if sequence == expected or next_sequence != expected + 1:
+            continue
+
+        repaired_record = dict(record)
+        repaired_record["original_text"] = record.get("text")
+        repaired_record["text"] = str(expected)
+        repaired_record["sequence_recovery"] = "neighbor_continuity"
+        repaired[index] = (expected, repaired_record, inline_text)
+    return repaired
+
+
 def _recover_missing_sequence_records(
     records,
     sequence_anchor,
@@ -1123,6 +1146,8 @@ def extract_entries(records, image_shape, source_image=None, rec_model=None):
         sequence_records.append(
             (sequence, synthetic_sequence_record, inline_text)
         )
+
+    sequence_records = _repair_sandwiched_sequence_values(sequence_records)
 
     if source_image is not None and rec_model is not None:
         sequence_records.extend(
