@@ -27,7 +27,7 @@ INTER_DIR = PROJECT_ROOT / "inter"
 TEXT_CROP_DIR = INTER_DIR / "text_crops"
 OCR_RESULT_DIR = INTER_DIR / "ocr_results"
 COMMAND_DIR = Path("./command")
-INPUT_IMAGE = Path("./assets/pdfs/35kV何楼变电站.pdf")
+INPUT_IMAGE = Path("./assets/pdfs/110kV天香变电站.pdf")
 PENDING_IMAGES = []
 
 # The sequence numbers are in the same narrow column as the "顺序" header.
