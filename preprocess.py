@@ -6,11 +6,16 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PDF_PAGE_ROOT = PROJECT_ROOT / "inter" / "preprocessed"
+IMAGE_INPUT_ROOT = PROJECT_ROOT / "assets" / "imgs"
 PDF_DPI = 260
 HEADER_HEIGHT_RATIO = 0.12
 TICKET_TITLE = "变电站倒闸操作票"
 TITLE_MIN_SIMILARITY = 0.6
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_GRID_SIZE = (8, 8)
+SHARPEN_SIGMA = 1.0
+SHARPEN_AMOUNT = 0.5
 
 
 def _normalized_text(text):
@@ -23,6 +28,65 @@ def _read_image(image_path):
     if image is None:
         raise ValueError(f"Cannot read image: {image_path}")
     return image
+
+
+def _is_path_within(path, directory):
+    try:
+        Path(path).resolve().relative_to(Path(directory).resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _enhance_document_image(image):
+    """Improve local contrast and edge clarity while preserving image colors."""
+    lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    lightness, channel_a, channel_b = cv2.split(lab_image)
+    clahe = cv2.createCLAHE(
+        clipLimit=CLAHE_CLIP_LIMIT,
+        tileGridSize=CLAHE_TILE_GRID_SIZE,
+    )
+    enhanced_lightness = clahe.apply(lightness)
+    contrast_enhanced = cv2.cvtColor(
+        cv2.merge((enhanced_lightness, channel_a, channel_b)),
+        cv2.COLOR_LAB2BGR,
+    )
+    blurred = cv2.GaussianBlur(
+        contrast_enhanced,
+        (0, 0),
+        sigmaX=SHARPEN_SIGMA,
+        sigmaY=SHARPEN_SIGMA,
+    )
+    return cv2.addWeighted(
+        contrast_enhanced,
+        1.0 + SHARPEN_AMOUNT,
+        blurred,
+        -SHARPEN_AMOUNT,
+        0,
+    )
+
+
+def _write_png(image_path, image):
+    image_path = Path(image_path)
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    success, encoded = cv2.imencode(".png", image)
+    if not success:
+        raise OSError(f"Failed to encode enhanced PNG image: {image_path}")
+    encoded.tofile(str(image_path))
+
+
+def _enhance_input_image(image_path, output_root=None):
+    image_path = Path(image_path)
+    if output_root is None:
+        output_root = PDF_PAGE_ROOT
+    relative_path = image_path.resolve().relative_to(IMAGE_INPUT_ROOT.resolve())
+    output_path = (
+        Path(output_root)
+        / relative_path.parent
+        / f"{image_path.stem}_enhanced.png"
+    )
+    _write_png(output_path, _enhance_document_image(_read_image(image_path)))
+    return output_path
 
 
 def _crop_text_region(image, points):
@@ -149,7 +213,11 @@ def preprocess_input(input_path, det_model, rec_model, rec_batch_size=4):
     if suffix == ".pdf":
         candidate_pages = _render_pdf_pages(input_path)
     elif suffix in IMAGE_SUFFIXES:
-        candidate_pages = [input_path]
+        candidate_pages = [
+            _enhance_input_image(input_path)
+            if _is_path_within(input_path, IMAGE_INPUT_ROOT)
+            else input_path
+        ]
     else:
         raise ValueError(
             f"Unsupported input type {input_path.suffix!r}; "

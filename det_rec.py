@@ -7,18 +7,27 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 from preprocess import preprocess_input
+from utils.recognition_validation import (
+    filter_continuous_recoveries,
+    is_non_entry_status_text,
+    normalized_text,
+    sequence_value,
+    split_merged_sequence_entry,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 # TODO: Replace this directory after the storage layout is decided.
 MODEL_ROOT = PROJECT_ROOT / "models"
-DET_MODEL_DIR = MODEL_ROOT / "PP-OCRv6_small_det"
-REC_MODEL_DIR = MODEL_ROOT / "PP-OCRv6_small_rec"
+DET_MODEL_DIR = MODEL_ROOT / "PP-OCRv6_medium_det_infer"
+REC_MODEL_DIR = MODEL_ROOT / "PP-OCRv6_medium_rec_infer"
 INTER_DIR = PROJECT_ROOT / "inter"
 TEXT_CROP_DIR = INTER_DIR / "text_crops"
+OCR_RESULT_DIR = INTER_DIR / "ocr_results"
 COMMAND_DIR = Path("./command")
-INPUT_IMAGE = Path("./assets/pdfs/220kV仿山变电站.pdf")
+INPUT_IMAGE = Path("./assets/pdfs/35kV何楼变电站.pdf")
 PENDING_IMAGES = []
 
 # The sequence numbers are in the same narrow column as the "顺序" header.
@@ -26,12 +35,41 @@ SEQUENCE_X_TOLERANCE_RATIO = 0.06
 # Ignore the check-mark column on the right side of the operation table.
 COMMAND_RIGHT_BOUNDARY_RATIO = 0.89
 REC_BATCH_SIZE = 4
+ENHANCE_TEXT_CROPS = True
+TEXT_CLAHE_CLIP_LIMIT = 1.8
+TEXT_SHARPEN_AMOUNT = 0.3
 OPERATION_TASK_MIN_SIMILARITY = 0.8
 OPERATION_TASK_MIN_CONFIDENCE = 0.75
 LOCAL_SEQUENCE_MIN_CONFIDENCE = 0.5
+# A geometry fallback may fill only small internal gaps.  It never invents a
+# page's first sequence number and never repairs duplicate or ambiguous rows.
+SEQUENCE_GEOMETRY_FALLBACK_MAX_GAP = 2
 UPLOAD_ORDER_ERROR = "请按照正确顺序上传操作票或拍摄更清晰的操作票"
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-NON_ENTRY_STATUS_TEXTS = {"已执行", "未执行", "作废"}
+
+
+class TicketRecognitionError(ValueError):
+    """A user-facing parsing failure with an optional source-page location."""
+
+    def __init__(self, region, detail, *, page_path=None):
+        self.region = region
+        self.detail = detail
+        self.page_path = page_path
+        super().__init__(detail)
+
+    def __str__(self):
+        page = f"页面：{Path(self.page_path).name}\n" if self.page_path else ""
+        return (
+            f"操作票识别失败\n{page}问题区域：{self.region}\n"
+            f"具体原因：{self.detail}\n{UPLOAD_ORDER_ERROR}"
+        )
+
+
+def _anchor_location(anchor):
+    return (
+        f"识别框位置 x={anchor['left']:.0f}～{anchor['right']:.0f}，"
+        f"y={anchor['top']:.0f}～{anchor['bottom']:.0f}（像素）"
+    )
 
 
 def crop_text_region(image, points):
@@ -68,9 +106,6 @@ def crop_text_region(image, points):
         borderMode=cv2.BORDER_REPLICATE,
     )
 
-    # Recognition models generally work better when tall text is horizontal.
-    if crop_height / crop_width >= 1.5:
-        crop = np.rot90(crop).copy()
     return crop
 
 
@@ -82,8 +117,31 @@ def _write_png(image_path, image):
     encoded.tofile(image_path)
 
 
+def _enhance_text_crop(crop):
+    """Enhance a small OCR crop without changing its dimensions or color mode."""
+    lightness, channel_a, channel_b = cv2.split(
+        cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    )
+    lightness = cv2.createCLAHE(
+        clipLimit=TEXT_CLAHE_CLIP_LIMIT,
+        tileGridSize=(2, 2),
+    ).apply(lightness)
+    contrast_enhanced = cv2.cvtColor(
+        cv2.merge((lightness, channel_a, channel_b)),
+        cv2.COLOR_LAB2BGR,
+    )
+    blurred = cv2.GaussianBlur(contrast_enhanced, (0, 0), sigmaX=0.8)
+    return cv2.addWeighted(
+        contrast_enhanced,
+        1.0 + TEXT_SHARPEN_AMOUNT,
+        blurred,
+        -TEXT_SHARPEN_AMOUNT,
+        0,
+    )
+
+
 def save_text_regions(result, output_dir, source_path):
-    """Save every detected text region and return the generated file paths."""
+    """Save OCR-ready crops for every detected region."""
     output_dir.mkdir(parents=True, exist_ok=True)
     source_image = result["input_img"].copy()
     source_name = Path(source_path).stem
@@ -91,6 +149,8 @@ def save_text_regions(result, output_dir, source_path):
 
     for region_index, points in enumerate(result["dt_polys"]):
         crop = crop_text_region(source_image, points)
+        if ENHANCE_TEXT_CROPS:
+            crop = _enhance_text_crop(crop)
         crop_path = output_dir / f"{source_name}_{region_index:03d}.png"
         _write_png(crop_path, crop)
         saved_paths.append(crop_path)
@@ -164,8 +224,113 @@ def recognize_text_regions(rec_model, crop_paths, polygons, detection_scores):
     return records
 
 
+def _annotation_font(size):
+    font_paths = (
+        "C:/Windows/Fonts/msyh.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    )
+    for font_path in font_paths:
+        if Path(font_path).is_file():
+            return ImageFont.truetype(font_path, size)
+    raise RuntimeError("OCR annotation requires a Chinese-capable font")
+
+
+def _wrap_annotation_text(draw, text, font, max_width):
+    lines = []
+    line = ""
+    for character in text or "(empty)":
+        if character == "\n":
+            lines.append(line)
+            line = ""
+        elif line and draw.textlength(line + character, font=font) > max_width:
+            lines.append(line)
+            line = character
+        else:
+            line += character
+    lines.append(line)
+    return lines
+
+
+def save_recognition_results(page_path, image, records, output_dir=OCR_RESULT_DIR):
+    """Save OCR data and a numbered image before ticket parsing can fail."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(page_path).stem
+    json_path = output_dir / f"{stem}.json"
+    image_path = output_dir / f"{stem}_annotated.png"
+    with json_path.open("w", encoding="utf-8") as output_file:
+        json.dump(
+            {"source_image": str(page_path), "regions": records},
+            output_file,
+            ensure_ascii=False,
+            indent=2,
+        )
+        output_file.write("\n")
+
+    source = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    sidebar_width = max(800, min(1400, source.width // 2))
+    font_size = max(20, min(30, source.width // 100))
+    font = _annotation_font(font_size)
+    line_height = font_size + 8
+    padding = 24
+    text_width = sidebar_width - 2 * padding
+    measure = ImageDraw.Draw(source)
+    entries = []
+    for record in records:
+        score = "n/a" if record["score"] is None else f'{record["score"]:.3f}'
+        title = (
+            f'#{record["index"]:03d}  OCR {score}  '
+            f'DET {record["det_score"]:.3f}'
+        )
+        lines = _wrap_annotation_text(measure, record["text"], font, text_width)
+        entries.append((title, lines))
+
+    entry_heights = [(len(lines) + 1) * line_height + 16 for _, lines in entries]
+    canvas_height = max(source.height, 2 * padding + sum(entry_heights))
+    canvas = Image.new("RGB", (source.width + sidebar_width, canvas_height), "white")
+    canvas.paste(source, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.line(
+        (source.width, 0, source.width, canvas_height),
+        fill="#b8b8b8",
+        width=2,
+    )
+
+    for record in records:
+        points = [tuple(point) for point in record["box"]]
+        draw.line(points + [points[0]], fill="#d3382b", width=3)
+        x = min(max(int(record["right"]) + 4, 0), source.width - 1)
+        y = min(max(int(record["top"]), 0), source.height - font_size)
+        draw.text(
+            (x, y),
+            f'{record["index"]:03d}',
+            font=font,
+            fill="#b52118",
+            stroke_width=2,
+            stroke_fill="white",
+        )
+
+    y = padding
+    for (title, lines), height in zip(entries, entry_heights):
+        x = source.width + padding
+        draw.text((x, y), title, font=font, fill="#b52118")
+        for line_index, line in enumerate(lines, start=1):
+            draw.text(
+                (x, y + line_index * line_height),
+                line,
+                font=font,
+                fill="#202020",
+            )
+        y += height
+        draw.line((x, y - 8, canvas.width - padding, y - 8), fill="#dedede")
+
+    canvas.save(image_path, format="PNG")
+    return json_path, image_path
+
+
 def _normalized_text(text):
-    return re.sub(r"\s+", "", text)
+    return normalized_text(text)
 
 
 def find_text_anchor(
@@ -194,7 +359,15 @@ def find_text_anchor(
             candidates.append((similarity, record))
 
     if not candidates:
-        raise ValueError(f"Cannot find the {target_text!r} text anchor")
+        confidence_note = (
+            f"（要求识别置信度至少为 {min_confidence:.0%}）"
+            if min_confidence is not None else ""
+        )
+        raise TicketRecognitionError(
+            f"“{target_text}”标签",
+            f"未找到可用的“{target_text}”文字标签{confidence_note}，"
+            "请检查该区域是否被裁切、遮挡或识别错误。",
+        )
     if prefer_confidence:
         return max(
             candidates,
@@ -204,6 +377,49 @@ def find_text_anchor(
         candidates,
         key=lambda item: (item[0], item[1]["score"] or 0.0),
     )[1]
+
+
+def find_unit_anchor(records):
+    """Locate a misrecognized unit label using the surrounding header layout."""
+    try:
+        return find_text_anchor(records, "单位")
+    except ValueError as original_error:
+        try:
+            issuer = find_text_anchor(records, "发令人")
+            start_time = find_text_anchor(records, "操作开始时间")
+            number = find_text_anchor(records, "编号")
+        except ValueError:
+            raise original_error from None
+
+        if not issuer["center_y"] < start_time["center_y"]:
+            raise original_error
+
+        number_height = max(number["bottom"] - number["top"], 1.0)
+        same_row_to_left = sorted(
+            (
+                record
+                for record in records
+                if record["right"] < number["left"]
+                and abs(record["center_y"] - number["center_y"])
+                <= 0.75
+                * max(number_height, record["bottom"] - record["top"], 1.0)
+            ),
+            key=lambda record: record["center_x"],
+        )
+        if len(same_row_to_left) < 2:
+            raise original_error
+
+        unit = same_row_to_left[-2]
+        if not unit["center_y"] < issuer["center_y"]:
+            raise original_error
+        for lower_label in (issuer, start_time):
+            label_width = max(lower_label["right"] - lower_label["left"], 1.0)
+            unit_width = max(unit["right"] - unit["left"], 1.0)
+            if abs(unit["center_x"] - lower_label["center_x"]) > (
+                0.65 * max(label_width, unit_width)
+            ):
+                raise original_error
+        return unit
 
 
 def find_operation_task_anchor(records):
@@ -419,7 +635,10 @@ def extract_mission(records):
 
     mission = "".join(parts)
     if not mission:
-        raise ValueError("Cannot find a value to the right of '操作任务'")
+        raise TicketRecognitionError(
+            "操作任务内容",
+            "已找到操作任务标签，但未识别到右侧的任务内容。",
+        )
     return mission
 
 
@@ -458,13 +677,21 @@ def extract_field_value(
     value_records.sort(key=lambda item: (item["center_y"], item["left"]))
     value = "".join(_normalized_text(record["text"]) for record in value_records)
     if not value:
-        raise ValueError(f"Cannot find a value to the right of {label_text!r}")
+        raise TicketRecognitionError(
+            f"“{label_text}”右侧内容",
+            f"已找到“{label_text}”标签，但同一行右侧未识别到有效内容；"
+            f"{_anchor_location(label)}。",
+        )
     return value
 
 
 def _sequence_value(text, *, allow_wrappers=False):
+    """Compatibility wrapper around :func:`utils.recognition_validation.sequence_value`."""
+    return sequence_value(text, allow_wrappers=allow_wrappers)
+    """Legacy local wrapper retained for callers inside this module."""
+    '''
     normalized = _normalized_text(text)
-    if re.fullmatch(r"\d{1,3}", normalized):
+    if re.fullmatch(r"\\d{1,3}", normalized):
         return int(normalized)
     if allow_wrappers:
         match = re.fullmatch(
@@ -474,19 +701,27 @@ def _sequence_value(text, *, allow_wrappers=False):
         if match is not None:
             return int(match.group(1))
     return None
+    '''
 
 
 def _is_non_entry_status_text(text):
+    """Compatibility wrapper around the shared status-text validator."""
+    return is_non_entry_status_text(text)
+    '''
     normalized = _normalized_text(text).strip(
         "()（）[]【】.:：。·,，;；|丨!！√✓✔∨V"
     )
     return normalized in NON_ENTRY_STATUS_TEXTS
+    '''
 
 
 def _split_merged_sequence_entry(record, sequence_anchor):
+    """Compatibility wrapper around the shared merged-entry validator."""
+    return split_merged_sequence_entry(record, sequence_anchor)
+    '''
     """Split a sequence prefix only when its box crosses the sequence column."""
     normalized = _normalized_text(record["text"])
-    match = re.fullmatch(r"(\d{1,3})(\D.*)", normalized)
+    match = re.fullmatch(r"(\\d{1,3})(\\D.*)", normalized)
     if match is None:
         return None
 
@@ -500,6 +735,7 @@ def _split_merged_sequence_entry(record, sequence_anchor):
         return None
 
     return int(match.group(1)), match.group(2)
+    '''
 
 
 def _group_operation_content_rows(records, sequence_anchor, image_shape, sequence_records):
@@ -747,7 +983,106 @@ def _recover_missing_sequence_records(
             "center_y": center_y,
         }
         recovered.append((sequence, synthetic_record, ""))
-    return _filter_continuous_recoveries(sequence_records, recovered)
+    return filter_continuous_recoveries(sequence_records, recovered)
+
+
+def _infer_missing_sequence_records(records, sequence_anchor, sequence_records, image_shape):
+    """Infer small internal sequence gaps from aligned operation-text rows.
+
+    This is deliberately conservative: every missing number must have exactly
+    one content row between two recognized sequence rows.  The fallback is
+    useful when the number cell is blurred or missed by detection, while a
+    genuinely reordered upload still fails the continuity check later.
+    """
+    existing = sorted(sequence_records, key=lambda item: item[1]["center_y"])
+    if len(existing) < 2:
+        return []
+
+    content_rows = _group_operation_content_rows(
+        records,
+        sequence_anchor,
+        image_shape,
+        sequence_records,
+    )
+    if not content_rows:
+        return []
+
+    inferred = []
+    used_row_ids = set()
+    existing_centers = [record[1]["center_y"] for record in existing]
+    image_height = image_shape[0]
+    alignment_tolerance = max(image_height * 0.012, 3.0)
+    for previous, current in zip(existing, existing[1:]):
+        previous_sequence, previous_record, _ = previous
+        current_sequence, current_record, _ = current
+        gap = current_sequence - previous_sequence - 1
+        if gap <= 0 or gap > SEQUENCE_GEOMETRY_FALLBACK_MAX_GAP:
+            continue
+
+        between = [
+            row
+            for row in content_rows
+            if previous_record["center_y"] < row["center_y"] < current_record["center_y"]
+            and not any(
+                abs(row["center_y"] - center_y) <= alignment_tolerance
+                for center_y in existing_centers
+            )
+            and id(row) not in used_row_ids
+        ]
+        if len(between) != gap:
+            continue
+
+        interval = (
+            current_record["center_y"] - previous_record["center_y"]
+        ) / (gap + 1)
+        position_tolerance = max(interval * 0.35, image_height * 0.012)
+        if any(
+            abs(
+                row["center_y"]
+                - (previous_record["center_y"] + interval * offset)
+            )
+            > position_tolerance
+            for offset, row in enumerate(between, start=1)
+        ):
+            continue
+
+        # A row that contains only a stray mark is not enough evidence to
+        # invent a sequence number.
+        if any(
+            not any(
+                record["center_x"] > sequence_anchor["right"]
+                and _normalized_text(record["text"]).strip("V√✓✔∨")
+                for record in row["records"]
+            )
+            for row in between
+        ):
+            continue
+
+        for offset, row in enumerate(between, start=1):
+            sequence = previous_sequence + offset
+            row_center = row["center_y"]
+            synthetic_record = {
+                "index": -(len(inferred) + 1001),
+                "text": str(sequence),
+                "score": None,
+                "det_score": 0.0,
+                "box": [
+                    [sequence_anchor["left"], row["top"]],
+                    [sequence_anchor["right"], row["top"]],
+                    [sequence_anchor["right"], row["bottom"]],
+                    [sequence_anchor["left"], row["bottom"]],
+                ],
+                "left": sequence_anchor["left"],
+                "right": sequence_anchor["right"],
+                "top": row["top"],
+                "bottom": row["bottom"],
+                "center_x": sequence_anchor["center_x"],
+                "center_y": row_center,
+            }
+            inferred.append((sequence, synthetic_record, ""))
+            used_row_ids.add(id(row))
+
+    return inferred
 
 
 def extract_entries(records, image_shape, source_image=None, rec_model=None):
@@ -801,9 +1136,24 @@ def extract_entries(records, image_shape, source_image=None, rec_model=None):
             )
         )
 
+    # Model-based recovery can still miss a blurred sequence cell.  Use the
+    # row geometry only for small, one-to-one internal gaps as a final fallback.
+    sequence_records.extend(
+        _infer_missing_sequence_records(
+            records,
+            sequence_anchor,
+            sequence_records,
+            image_shape,
+        )
+    )
+
     sequence_records.sort(key=lambda item: item[1]["center_y"])
     if not sequence_records:
-        raise ValueError("No sequence numbers were found below the '顺序' anchor")
+        raise TicketRecognitionError(
+            "顺序列（表格左侧）",
+            "已找到“顺序”表头，但表头下方未识别到任何有效序号；"
+            f"表头{_anchor_location(sequence_anchor)}。",
+        )
 
     centers = [record["center_y"] for _, record, _ in sequence_records]
     if len(centers) > 1:
@@ -850,7 +1200,11 @@ def extract_entries(records, image_shape, source_image=None, rec_model=None):
 
         key = str(sequence)
         if key in entries:
-            raise ValueError(f"Duplicate sequence number detected: {key}")
+            raise TicketRecognitionError(
+                f"顺序列，第 {key} 项",
+                f"同一页重复识别到序号 {key}；"
+                f"重复项{_anchor_location(sequence_record)}。",
+            )
         entries[key] = entry_text
 
     return entries
@@ -863,6 +1217,7 @@ def extract_ticket_data(records, image_shape, source_image=None, rec_model=None)
             records,
             "单位",
             right_label_text="编号",
+            label_anchor=find_unit_anchor(records),
         ),
         "mission": extract_mission(records),
         "id": extract_field_value(records, "编号"),
@@ -881,9 +1236,30 @@ def merge_page_entries(entries, page_entries, page_path):
     for key, text in page_entries.items():
         sequence = int(key)
         if key in entries:
-            raise ValueError(UPLOAD_ORDER_ERROR)
+            raise TicketRecognitionError(
+                f"顺序列，第 {key} 项",
+                f"序号 {key} 在此前页面已经出现，本页再次出现。"
+                "请检查是否重复上传页面、页面顺序错误或序号识别错误。",
+                page_path=page_path,
+            )
         if previous_sequence is not None and sequence != previous_sequence + 1:
-            raise ValueError(UPLOAD_ORDER_ERROR)
+            expected = previous_sequence + 1
+            if sequence > expected:
+                missing = str(expected) if sequence == expected + 1 else f"{expected}～{sequence - 1}"
+                detail = (
+                    f"上一有效项序号为 {previous_sequence}，应接续 {expected}，"
+                    f"本页实际识别到 {sequence}；未找到第 {missing} 项的有效序号或操作内容。"
+                    "请检查是否漏页，或这些项的序号/操作内容不清晰。"
+                )
+            else:
+                detail = (
+                    f"上一有效项序号为 {previous_sequence}，应接续 {expected}，"
+                    f"本页实际识别到 {sequence}，序号发生倒退。"
+                    "请检查页面顺序或序号识别结果。"
+                )
+            raise TicketRecognitionError(
+                f"顺序列，第 {key} 项前的衔接处", detail, page_path=page_path,
+            )
         entries[key] = text
         previous_sequence = sequence
 
@@ -892,7 +1268,11 @@ def merge_ticket_data_page(ticket_data_list, page_data, page_path):
     """Group one parsed page by mission and enforce upload order."""
     page_entries = page_data["entries"]
     if not page_entries:
-        raise ValueError(UPLOAD_ORDER_ERROR)
+        raise TicketRecognitionError(
+            "操作项目列（顺序列右侧）",
+            "本页未提取到任何有效操作项目。已识别到序号，但对应行右侧的操作内容为空或未被识别。",
+            page_path=page_path,
+        )
 
     first_sequence = int(next(iter(page_entries)))
     starts_new_ticket = (
@@ -902,7 +1282,21 @@ def merge_ticket_data_page(ticket_data_list, page_data, page_path):
 
     if starts_new_ticket:
         if first_sequence != 1:
-            raise ValueError(UPLOAD_ORDER_ERROR)
+            detail = (
+                f"本页被判定为新操作票，首个有效操作项应为 1，实际为 {first_sequence}。"
+            )
+            if not ticket_data_list:
+                detail += "请检查是否缺少首页，或首页第 1 项的序号/内容未识别到。"
+            else:
+                detail += (
+                    f"本页操作任务“{page_data['mission']}”与上一票操作任务"
+                    f"“{ticket_data_list[-1]['mission']}”不一致。"
+                    "如果本页是续页，请检查操作任务区域是否识别错误；"
+                    "如果是另一张票，请检查其首页是否缺失或页面顺序是否正确。"
+                )
+            raise TicketRecognitionError(
+                "首个操作项 / 操作任务区域", detail, page_path=page_path,
+            )
         new_ticket = {
             "substation": page_data["substation"],
             "mission": page_data["mission"],
@@ -929,12 +1323,17 @@ def merge_ticket_page(
     rec_model=None,
 ):
     """Parse and merge one page into the ordered operation-ticket list."""
-    page_data = extract_ticket_data(
-        records,
-        image_shape,
-        source_image=source_image,
-        rec_model=rec_model,
-    )
+    try:
+        page_data = extract_ticket_data(
+            records,
+            image_shape,
+            source_image=source_image,
+            rec_model=rec_model,
+        )
+    except TicketRecognitionError as error:
+        raise TicketRecognitionError(
+            error.region, error.detail, page_path=page_path,
+        ) from error
     merge_ticket_data_page(ticket_data_list, page_data, page_path)
 
     return ticket_data_list
@@ -981,13 +1380,13 @@ def main():
         "run_mode": "mkldnn",
     }
     det_model = TextDetection(
-        model_name="PP-OCRv6_small_det",
+        model_name="PP-OCRv6_medium_det",
         model_dir=DET_MODEL_DIR.resolve(),
         engine="paddle_static",
         engine_config=engine_config,
     )
     rec_model = TextRecognition(
-        model_name="PP-OCRv6_small_rec",
+        model_name="PP-OCRv6_medium_rec",
         model_dir=REC_MODEL_DIR.resolve(),
         engine="paddle_static",
         engine_config=engine_config,
@@ -1014,11 +1413,17 @@ def main():
                 detection_result.save_to_img(save_path=str(INTER_DIR))
 
                 records = recognize_text_regions(
-                rec_model,
-                crop_paths,
-                detection_result["dt_polys"],
-                detection_result["dt_scores"],
-            )
+                    rec_model,
+                    crop_paths,
+                    detection_result["dt_polys"],
+                    detection_result["dt_scores"],
+                )
+                json_path, annotated_path = save_recognition_results(
+                    page_path,
+                    detection_result["input_img"],
+                    records,
+                )
+                print(f"Saved per-region OCR to {json_path} and {annotated_path}")
                 merge_ticket_page(
                     ticket_data_list,
                     records,
@@ -1027,11 +1432,10 @@ def main():
                     source_image=detection_result["input_img"],
                     rec_model=rec_model,
                 )
-    except ValueError as error:
-        if str(error) == UPLOAD_ORDER_ERROR:
-            print(UPLOAD_ORDER_ERROR)
-            return
-        raise
+    except TicketRecognitionError as error:
+        print(str(error))
+        print(f"请查看本页逐框识别结果：{json_path}\n标注图：{annotated_path}")
+        return
 
     if not ticket_data_list:
         raise ValueError("No operation-ticket pages produced OCR results")

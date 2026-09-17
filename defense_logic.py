@@ -1,36 +1,108 @@
 import json
-from validate_mission import *
+import re
+from pathlib import Path
+
+from validate_mission import (
+    ValidationResult,
+    merge_results,
+    normalize_text,
+    validate_busbar_transfer,
+    validate_grounding_prerequisites,
+    validate_hot_standby_to_cold_standby,
+    validate_main_transformer_transition,
+    validate_sequence_control_ticket,
+)
 
 
-def read_json(path):
-    with open(path, 'r', encoding='utf-8') as json_file:
-        data = json.load(json_file)
-        return data
+def read_json(path: str | Path) -> dict:
+    with open(path, "r", encoding="utf-8") as json_file:
+        return json.load(json_file)
 
 
-def judge_type(mission: str) -> dict:
-    submissions = mission.split(r'[，,]')
-    print(submissions)
-    submission_and_type = {}
-    for submission in submissions:
-        #Todo: 判断切分后的每句话属于哪种操作
-        continue
-    return submission_and_type
+def _has_direction(text: str, source: str, target: str) -> bool:
+    return bool(re.search(rf"由[^，,。；;]*{source}[^，,。；;]*(?:转|至|到|切至|变为)[^，,。；;]*{target}", text))
 
 
-def process_ticket(src: str) -> bool:
-    # 1.读取json字典
-    data = read_json(src)
+def _classify_clause(clause: str) -> str:
+    text = normalize_text(clause)
+    if text.startswith("核对"):
+        return "audit_only"
+    if re.search(r"主变|变压器", text) and (
+        _has_direction(text, r"运行", r"热备(?:用)?")
+        or _has_direction(text, r"热备(?:用)?", r"运行")
+    ):
+        return "main_transformer_running_hot_standby"
+    if _has_direction(text, r"热备(?:用)?", r"冷备(?:用)?"):
+        return "hot_standby_to_cold_standby"
+    if _has_direction(text, r"冷备(?:用)?", r"热备(?:用)?"):
+        return "cold_standby_to_hot_standby"
+    if _has_direction(text, r"冷备(?:用)?", r"(?:开关及线路)?检修"):
+        return "cold_standby_to_maintenance"
+    if _has_direction(text, r"(?:开关及线路)?检修", r"冷备(?:用)?"):
+        return "maintenance_to_cold_standby"
+    if _has_direction(text, r"运行", r"热备(?:用)?"):
+        return "running_to_hot_standby"
+    if _has_direction(text, r"热备(?:用)?", r"运行"):
+        return "hot_standby_to_running"
+    if re.search(r"母线.*(?:倒至|倒换|切换|转移)|(?:倒至|倒换|切换|转移).*母线", text):
+        return "busbar_transfer"
+    if re.search(r"^(?:拉开|断开|分闸).*(?:开关|断路器|刀闸)", text):
+        return "switch_open"
+    return "others"
 
-    # 2.切分并判断任务类型
-    submission_and_type = judge_type(data["mission"])
 
-    # 3.智能闭锁逻辑判断
-    for item in submission_and_type:
-        submission = item["submission"]
-        type = item["type"]
-        #Todo: 根据种类走对应的校验逻辑
-    return True
+def judge_type(mission: str) -> list[dict[str, str]]:
+    """Split a mission and preserve state-transition direction."""
+    clauses = [
+        item.strip()
+        for item in re.split(r"[，,、;；。]+", str(mission or ""))
+        if item.strip()
+    ]
+    return [
+        {"submission": clause, "type": _classify_clause(clause)}
+        for clause in clauses
+    ]
 
-src_route = "./command/220kV从庙变电站_核对35kV冉固线线路及3104开关在运行状态，现场具备操作条件_0901181553.json"
-process_ticket(src_route)
+
+def validate_ticket(data: dict) -> ValidationResult:
+    mission = str(data.get("mission", ""))
+    entries = data.get("entries", {})
+    types = {item["type"] for item in judge_type(mission)}
+    results: list[ValidationResult] = []
+
+    if "顺控" in normalize_text(mission):
+        return merge_results("ticket", [validate_sequence_control_ticket(entries, mission)])
+
+    # Grounding safety is action-driven and applies regardless of mission title.
+    results.append(validate_grounding_prerequisites(entries))
+    if "hot_standby_to_cold_standby" in types:
+        results.append(validate_hot_standby_to_cold_standby(entries))
+    if "main_transformer_running_hot_standby" in types:
+        results.append(validate_main_transformer_transition(entries, mission))
+    if "busbar_transfer" in types:
+        results.append(validate_busbar_transfer(entries, mission))
+
+    return merge_results("ticket", results)
+
+
+def process_ticket_details(src: str | Path) -> ValidationResult:
+    return validate_ticket(read_json(src))
+
+
+def process_ticket(src: str | Path) -> bool:
+    """Return True only when the ticket passes without manual-review findings."""
+    return process_ticket_details(src).passed
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Validate a station operation ticket")
+    parser.add_argument("ticket", type=Path, help="Path to a command JSON file")
+    args = parser.parse_args()
+    result = process_ticket_details(args.ticket)
+    print(json.dumps({
+        "status": result.status,
+        "findings": [finding.__dict__ for finding in result.findings],
+    }, ensure_ascii=False, indent=2))
+    raise SystemExit(0 if result.passed else 1)
