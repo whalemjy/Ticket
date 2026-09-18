@@ -1290,7 +1290,7 @@ def merge_page_entries(entries, page_entries, page_path):
 
 
 def merge_ticket_data_page(ticket_data_list, page_data, page_path):
-    """Group one parsed page by mission and enforce upload order."""
+    """Merge pages by mission or ticket ID, keeping the first page authoritative."""
     page_entries = page_data["entries"]
     if not page_entries:
         raise TicketRecognitionError(
@@ -1300,10 +1300,12 @@ def merge_ticket_data_page(ticket_data_list, page_data, page_path):
         )
 
     first_sequence = int(next(iter(page_entries)))
-    starts_new_ticket = (
-        not ticket_data_list
-        or page_data["mission"] != ticket_data_list[-1]["mission"]
+    previous_ticket = ticket_data_list[-1] if ticket_data_list else None
+    matches_previous_ticket = previous_ticket is not None and (
+        page_data["mission"] == previous_ticket["mission"]
+        or page_data["id"] == previous_ticket["id"]
     )
+    starts_new_ticket = previous_ticket is None or not matches_previous_ticket
 
     if starts_new_ticket:
         if first_sequence != 1:
@@ -1315,12 +1317,13 @@ def merge_ticket_data_page(ticket_data_list, page_data, page_path):
             else:
                 detail += (
                     f"本页操作任务“{page_data['mission']}”与上一票操作任务"
-                    f"“{ticket_data_list[-1]['mission']}”不一致。"
-                    "如果本页是续页，请检查操作任务区域是否识别错误；"
+                    f"“{previous_ticket['mission']}”不一致，且本页编号“{page_data['id']}”"
+                    f"与上一票编号“{previous_ticket['id']}”不一致。"
+                    "如果本页是续页，请检查操作任务或编号区域是否识别错误；"
                     "如果是另一张票，请检查其首页是否缺失或页面顺序是否正确。"
                 )
             raise TicketRecognitionError(
-                "首个操作项 / 操作任务区域", detail, page_path=page_path,
+                "首个操作项 / 操作任务 / 编号区域", detail, page_path=page_path,
             )
         new_ticket = {
             "substation": page_data["substation"],
